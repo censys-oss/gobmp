@@ -7,9 +7,7 @@ A Go package for reading and writing BMP image files.
 Installation
 ------------
 
-To download and install, at a command prompt type:
-
-    go get github.com/jsummers/gobmp
+Import as: `github.com/censys-oss/gobmp` and `go mod tidy`
 
 
 Documentation
@@ -20,11 +18,7 @@ Gobmp is designed to work the same as Go's standard
 cause the image.Decode function to support reading BMP files.
 
 The documentation may be read online at
-[GoDoc](http://godoc.org/github.com/jsummers/gobmp).
-
-Or, after installing, type:
-
-    godoc github.com/jsummers/gobmp | more
+[GoDoc](http://godoc.org/github.com/censys-oss/gobmp)
 
 
 Status
@@ -43,5 +37,6 @@ License
 Gobmp is distributed under an MIT-style license. Refer to the COPYING.txt
 file.
 
+Copyright &copy; 2025 Censys
 Copyright &copy; 2012-2015 Jason Summers
 <[jason1@pobox.com](mailto:jason1@pobox.com)>
