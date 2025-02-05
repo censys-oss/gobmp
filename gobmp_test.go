@@ -4,14 +4,18 @@
 
 package gobmp
 
-import "testing"
-import "image"
-import "image/color"
-import "image/png"
-import "os"
-import "io/ioutil"
-import "bytes"
-import "fmt"
+import (
+	"bytes"
+	"fmt"
+	"github.com/stretchr/testify/assert"
+	"image"
+	"image/color"
+	"image/png"
+	"io/ioutil"
+	"os"
+	"path/filepath"
+	"testing"
+)
 
 func readImageFromFile(t *testing.T, srcFilename string) image.Image {
 	var err error
@@ -89,7 +93,7 @@ func compareFiles(t *testing.T, expectedFN string, actualFN string) {
 
 	if len(expectedBytes) != len(actualBytes) {
 		t.Logf("%s and %s differ in size %d %d \n",
-		 expectedFN, actualFN, len(expectedBytes), len(actualBytes))
+			expectedFN, actualFN, len(expectedBytes), len(actualBytes))
 		t.Fail()
 		return
 	}
@@ -229,5 +233,17 @@ func TestDecode(t *testing.T) {
 		writeImageToFile(t, m, dstFN, "png", nil)
 		// this fails, though they look about the same
 		// compareFiles(t, expectedFN, dstFN)
+	}
+}
+
+func TestMemoryLimit(t *testing.T) {
+	assert := assert.New(t)
+	files, _ := filepath.Glob("testdata/memorylimit/*.bmpb")
+	for _, f := range files {
+		icoData, err := os.ReadFile(f)
+		assert.NoError(err, f)
+		r := bytes.NewReader(icoData)
+		_, err = Decode(r, WithMemoryLimit(10_000_000))
+		assert.ErrorIs(err, ErrMemoryLimitExceeded)
 	}
 }
