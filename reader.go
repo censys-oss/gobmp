@@ -33,8 +33,8 @@ type decoder struct {
 	img_Paletted *image.Paletted // Used if dstHasPalette is true
 	img_NRGBA    *image.NRGBA    // Used otherwise
 
-	bfOffBits     uint32
-	headerSize    uint32
+	bfOffBits  uint32
+	headerSize uint32
 	width         int
 	height        int
 	bitCount      int
@@ -51,6 +51,23 @@ type decoder struct {
 	hasBitFieldsSegment  bool
 	bitFieldsSegmentSize int
 	bitFields            [4]bitFieldsInfo
+	memoryLimit          uint32
+}
+
+var ErrMemoryLimitExceeded = UnsupportedError("memory limit exceeded during BMP decoding")
+
+type DecodeOptions struct {
+	// max bytes allowed to allocate
+	memoryLimit uint32
+}
+
+type DecodeOptFunc func(*DecodeOptions)
+
+// WithMemoryLimit sets memory limit
+func WithMemoryLimit(limit uint32) DecodeOptFunc {
+	return func(o *DecodeOptions) {
+		o.memoryLimit = max(o.memoryLimit, limit)
+	}
 }
 
 // An UnsupportedError reports that the input uses a valid but unimplemented
@@ -64,6 +81,8 @@ type FormatError string
 
 func (e FormatError) Error() string { return "bmp: invalid format: " + string(e) }
 
+// safety: these 2 functions take in a slice
+// with length equal to the number bytes they access
 func getWORD(b []byte) uint32 {
 	return uint32(b[0]) | uint32(b[1])<<8
 }
@@ -71,27 +90,28 @@ func getDWORD(b []byte) uint32 {
 	return uint32(b[0]) | uint32(b[1])<<8 | uint32(b[2])<<16 | uint32(b[3])<<24
 }
 
-func decodeRow_paletted(d *decoder, buf []byte, j int) error {
-	for i := 0; i < d.width; i++ {
-		var v byte
+func decodeRow_paletted(d *decoder, buf []byte, row int) error {
+	rowSize := d.img_Paletted.Stride
+	for col := 0; col < d.width; col++ {
+		var colorInd byte
 
 		switch d.bitCount {
 		case 8:
-			v = buf[i]
+			colorInd = buf[col]
 		case 4:
-			v = (buf[i/2] >> (4 * (1 - uint(i)%2))) & 0x0f
+			colorInd = (buf[col/2] >> (4 * (1 - uint(col)%2))) & 0x0f
 		case 2:
-			v = (buf[i/4] >> (2 * (3 - uint(i)%4))) & 0x03
+			colorInd = (buf[col/4] >> (2 * (3 - uint(col)%4))) & 0x03
 		case 1:
-			v = (buf[i/8] >> (1 * (7 - uint(i)%8))) & 0x01
+			colorInd = (buf[col/8] >> (1 * (7 - uint(col)%8))) & 0x01
 		}
-		if int(v) >= d.dstPalNumEntries {
+		if int(colorInd) >= d.dstPalNumEntries {
 			// Out-of-range palette index.
 			// Most BMP viewers use the first palette color for such pixels, so
 			// that's what we'll do.
-			v = 0
+			colorInd = 0
 		}
-		d.img_Paletted.Pix[j*d.img_Paletted.Stride+i] = v
+		d.img_Paletted.Pix[row*rowSize+col] = colorInd
 	}
 	return nil
 }
@@ -147,9 +167,9 @@ var rowDecoders = map[int]decodeRowFuncType{
 }
 
 func (d *decoder) readBitsUncompressed() error {
-	var err error
 
 	srcRowStride := ((d.width*d.bitCount + 31) / 32) * 4
+	// d.width limited before this
 	buf := make([]byte, srcRowStride)
 
 	decodeRowFunc := rowDecoders[d.bitCount]
@@ -166,7 +186,7 @@ func (d *decoder) readBitsUncompressed() error {
 			dstRow = d.height - srcRow - 1
 		}
 
-		_, err = io.ReadFull(d.r, buf)
+		_, err := io.ReadFull(d.r, buf)
 		if err != nil {
 			return err
 		}
@@ -174,23 +194,6 @@ func (d *decoder) readBitsUncompressed() error {
 		if err != nil {
 			return err
 		}
-	}
-	return nil
-}
-
-func (d *decoder) skipBytes(n int) error {
-	var buf [1024]byte
-
-	for n > 0 {
-		bytesToRead := len(buf)
-		if bytesToRead > n {
-			bytesToRead = n
-		}
-		_, err := io.ReadFull(d.r, buf[:bytesToRead])
-		if err != nil {
-			return err
-		}
-		n -= bytesToRead
 	}
 	return nil
 }
@@ -206,7 +209,8 @@ func (d *decoder) readGap() error {
 	}
 	gapSize := int(d.bfOffBits) - currentOffset
 
-	return d.skipBytes(gapSize)
+	_, err := io.CopyN(io.Discard, d.r, int64(gapSize))
+	return err
 }
 
 // Read a 12-byte BITMAPCOREHEADER.
@@ -235,8 +239,8 @@ func decodeInfoHeader12(d *decoder, h []byte, configOnly bool) error {
 // Use of this function does not imply that the entire header is 40 bytes.
 // We may just be decoding the first 40 bytes of a 108- or 124-byte header.
 func decodeInfoHeader40(d *decoder, h []byte, configOnly bool) error {
-	d.width = int(int32(getDWORD(h[4:8])))
-	d.height = int(int32(getDWORD(h[8:12])))
+	d.width = int(getDWORD(h[4:8]))
+	d.height = int(getDWORD(h[8:12]))
 	if d.height < 0 {
 		d.isTopDown = true
 		d.height = -d.height
@@ -299,8 +303,7 @@ func decodeInfoHeader40(d *decoder, h []byte, configOnly bool) error {
 }
 
 func decodeInfoHeader108(d *decoder, h []byte, configOnly bool) error {
-	var err error
-	err = decodeInfoHeader40(d, h[:40], configOnly)
+	err := decodeInfoHeader40(d, h[:40], configOnly)
 	if err != nil {
 		return err
 	}
@@ -320,7 +323,6 @@ type decodeInfoHeaderFuncType func(d *decoder, h []byte, configOnly bool) error
 
 func readInfoHeader(d *decoder, configOnly bool) error {
 	var h []byte
-	var err error
 	var decodeFn decodeInfoHeaderFuncType
 
 	switch d.headerSize {
@@ -336,7 +338,7 @@ func readInfoHeader(d *decoder, configOnly bool) error {
 
 	// Read the rest of the infoheader
 	h = make([]byte, d.headerSize)
-	_, err = io.ReadFull(d.r, h[4:])
+	_, err := io.ReadFull(d.r, h[4:])
 	if err != nil {
 		return err
 	}
@@ -385,6 +387,7 @@ func (d *decoder) recordBitFields(r, g, b, a uint32) {
 }
 
 func (d *decoder) readBitFieldsSegment() error {
+	// 12 or 0
 	buf := make([]byte, d.bitFieldsSegmentSize)
 	_, err := io.ReadFull(d.r, buf[:])
 	if err != nil {
@@ -396,9 +399,8 @@ func (d *decoder) readBitFieldsSegment() error {
 }
 
 func (d *decoder) readPalette() error {
-	var err error
 	buf := make([]byte, d.srcPalSizeInBytes)
-	_, err = io.ReadFull(d.r, buf)
+	_, err := io.ReadFull(d.r, buf)
 	if err != nil {
 		return err
 	}
@@ -415,6 +417,8 @@ func (d *decoder) readPalette() error {
 
 	d.dstPalette = make(color.Palette, d.dstPalNumEntries)
 	for i := 0; i < d.dstPalNumEntries; i++ {
+		// TODO: find 4 byte entry palette bmp
+		// and add branch to handle this (simple)
 		d.dstPalette[i] = color.RGBA{buf[i*d.srcPalBytesPerEntry+2],
 			buf[i*d.srcPalBytesPerEntry+1],
 			buf[i*d.srcPalBytesPerEntry+0], 255}
@@ -432,10 +436,9 @@ func (d *decoder) decodeFileHeader(b []byte) error {
 
 func (d *decoder) readHeaders(configOnly bool) error {
 	var fh [18]byte
-	var err error
 
 	// Read the file header, and the first 4 bytes of the info header
-	_, err = io.ReadFull(d.r, fh[:])
+	_, err := io.ReadFull(d.r, fh[:])
 	if err != nil {
 		return err
 	}
@@ -456,10 +459,9 @@ func (d *decoder) readHeaders(configOnly bool) error {
 }
 
 func (d *decoder) readMain(r io.Reader, configOnly bool) (image.Image, error) {
-	var err error
 
 	// Read the FILEHEADER and INFOHEADER.
-	err = d.readHeaders(false)
+	err := d.readHeaders(false)
 	if err != nil {
 		return nil, err
 	}
@@ -491,12 +493,6 @@ func (d *decoder) readMain(r io.Reader, configOnly bool) (image.Image, error) {
 		return nil, UnsupportedError(fmt.Sprintf("compression or image type %d", d.biCompression))
 	}
 
-	// Assuming 'int' is 32 bits, an NRGBA image can't handle more than (2^31-1)/4
-	// pixels. This test is more conservative than it could be.
-	if d.width > 46340 || d.height > 46340 || d.width*d.height >= 0x20000000 {
-		return nil, UnsupportedError("dimensions too large")
-	}
-
 	// Read the BITFIELDS segment, if present.
 	if d.hasBitFieldsSegment {
 		err = d.readBitFieldsSegment()
@@ -519,8 +515,14 @@ func (d *decoder) readMain(r io.Reader, configOnly bool) (image.Image, error) {
 
 	// Create the target image.
 	if d.dstHasPalette {
+		if d.memoryLimit > 0 && uint32(d.width*d.height) > d.memoryLimit {
+			return nil, ErrMemoryLimitExceeded
+		}
 		d.img_Paletted = image.NewPaletted(image.Rect(0, 0, d.width, d.height), d.dstPalette)
 	} else {
+		if d.memoryLimit > 0 && uint32(4*d.width*d.height) > d.memoryLimit {
+			return nil, ErrMemoryLimitExceeded
+		}
 		d.img_NRGBA = image.NewNRGBA(image.Rect(0, 0, d.width, d.height))
 	}
 
@@ -547,11 +549,15 @@ func (d *decoder) readMain(r io.Reader, configOnly bool) (image.Image, error) {
 }
 
 // Decode reads a BMP image from r and returns it as an image.Image.
-func Decode(r io.Reader) (image.Image, error) {
-	var err error
+func Decode(r io.Reader, opts ...DecodeOptFunc) (image.Image, error) {
 
 	d := new(decoder)
 	d.r = r
+	options := DecodeOptions{}
+	for _, opt := range opts {
+		opt(&options)
+	}
+	d.memoryLimit = options.memoryLimit
 
 	im, err := d.readMain(r, false)
 	return im, err
@@ -560,13 +566,12 @@ func Decode(r io.Reader) (image.Image, error) {
 // DecodeConfig returns the color model and dimensions of the BMP image without
 // decoding the entire image.
 func DecodeConfig(r io.Reader) (image.Config, error) {
-	var err error
 	var cfg image.Config
 
 	d := new(decoder)
 	d.r = r
 
-	_, err = d.readMain(r, true)
+	_, err := d.readMain(r, true)
 	if err != nil {
 		return cfg, err
 	}
@@ -583,5 +588,11 @@ func DecodeConfig(r io.Reader) (image.Config, error) {
 }
 
 func init() {
-	image.RegisterFormat("bmp", "BM", Decode, DecodeConfig)
+	image.RegisterFormat("bmp", "BM", func(r io.Reader) (image.Image, error) {
+		img, err := Decode(r)
+		if err != nil {
+			return nil, err
+		}
+		return img, nil
+	}, DecodeConfig)
 }
